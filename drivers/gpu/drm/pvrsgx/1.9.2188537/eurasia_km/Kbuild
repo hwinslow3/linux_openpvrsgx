@@ -55,6 +55,8 @@ endif
 endif
 endif
 
+EXTRA_CFLAGS += -DLINUX
+
 ifeq ($(TI_PLATFORM),ti335x)
 DRIFILES = services4/srvkm/env/linux/pvr_drm.c services4/3rdparty/dc_ti335x_linux/omaplfb_linux.c services4/3rdparty/dc_ti335x_linux/omaplfb_displayclass.c 
 else
