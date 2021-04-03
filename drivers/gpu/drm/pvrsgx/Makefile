@@ -28,6 +28,8 @@
 
 pvr_drv=no
 
+export KERNELDIR=$(srctree)
+
 ifeq ($(CONFIG_PVRSGX_1_9_2188537),y)
 SUBPATH=1.9.2188537/eurasia_km
 else ifeq ($(CONFIG_PVRSGX_1_9_2253347),y)
