@@ -1,5 +1,7 @@
 obj-m	:= pvrsrvkm.o
 
+export PVR_BUILD_DIR := $(src)
+
 FILES := \
 services4/srvkm/common/queue.c \
 services4/srvkm/common/hash.c \
