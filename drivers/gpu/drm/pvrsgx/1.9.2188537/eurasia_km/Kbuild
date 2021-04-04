@@ -1,6 +1,7 @@
 obj-m	:= pvrsrvkm.o
 
 export PVR_BUILD_DIR := $(src)
+export PVR_BUILD_TYPE := release
 
 FILES := \
 services4/srvkm/common/queue.c \
@@ -58,6 +59,8 @@ endif
 EXTRA_CFLAGS += -DLINUX
 EXTRA_CFLAGS += -DPVR_SECURE_HANDLES
 EXTRA_CFLAGS += -DPVRSRV_MODNAME="\"$(PVRSRV_MODNAME)"\"
+EXTRA_CFLAGS += -DPVR_BUILD_DIR="\"$(PVR_BUILD_DIR)\"" -DPVR_BUILD_TYPE="\"$(PVR_BUILD_TYPE)\""
+
 
 export PVR_SECURE_HANDLES := 1
 
