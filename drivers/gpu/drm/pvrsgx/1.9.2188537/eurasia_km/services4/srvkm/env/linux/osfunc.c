@@ -3823,6 +3823,85 @@ typedef void (*OuterCacheOp_t)(phys_addr_t uStart, phys_addr_t uEnd);
 typedef void (*OuterCacheOp_t)(unsigned long ulStart, unsigned long ulEnd);
 #endif
 
+/* g_sMMapMutex must be held while this function is called */
+
+static
+IMG_VOID *FindMMapBaseVAddr(struct list_head *psMMapOffsetStructList,
+							IMG_VOID *pvRangeAddrStart, IMG_UINT32 ui32Length)
+{
+	PKV_OFFSET_STRUCT psOffsetStruct;
+	IMG_VOID *pvMinVAddr;
+
+	/* There's no kernel-virtual for this type of allocation, so if
+	 * we're flushing it, it must be user-virtual, and therefore
+	 * have a mapping.
+	 */
+	list_for_each_entry(psOffsetStruct, psMMapOffsetStructList, sAreaItem)
+	{
+		if(OSGetCurrentProcessIDKM() != psOffsetStruct->ui32PID)
+			continue;
+
+		pvMinVAddr = (IMG_VOID *)psOffsetStruct->ui32UserVAddr;
+
+		/* Within permissible range */
+		if(pvRangeAddrStart >= pvMinVAddr &&
+		   ui32Length <= psOffsetStruct->ui32RealByteSize)
+			return pvMinVAddr;
+	}
+
+	return IMG_NULL;
+}
+
+extern PVRSRV_LINUX_MUTEX g_sMMapMutex;
+
+#if ! defined(__arm__)
+# define USE_VIRTUAL_CACHE_OP
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0)
+# define USE_VIRTUAL_CACHE_OP
+# if defined(CONFIG_OUTER_CACHE)
+#  define USE_PHYSICAL_CACHE_OP
+# endif
+#else
+# define USE_PHYSICAL_CACHE_OP
+#endif
+
+static inline void DoInnerCacheOp(IMG_HANDLE hOSMemHandle,
+								  IMG_UINT32 ui32ByteOffset,
+								  IMG_VOID *pvRangeAddrStart,
+								  IMG_UINT32 ui32Length,
+								  InnerCacheOp_t pfnInnerCacheOp)
+{
+	LinuxMemArea *psLinuxMemArea = hOSMemHandle;
+
+	if (!psLinuxMemArea->hBMHandle)
+	{
+		pfnInnerCacheOp(pvRangeAddrStart, pvRangeAddrStart + ui32Length);
+	}
+	else
+	{
+		IMG_UINT32 ui32ByteRemain = ui32Length;
+		IMG_UINT32 ui32BytesToDo = PAGE_SIZE - (((IMG_UINT32) pvRangeAddrStart) & (~PAGE_MASK));
+		IMG_UINT8 *pbDo = (IMG_UINT8 *) pvRangeAddrStart;
+	
+		while(ui32ByteRemain)
+		{
+			if (BM_MapPageAtOffset(psLinuxMemArea->hBMHandle, ui32ByteOffset + (ui32Length - ui32ByteRemain)))
+			{
+				pfnInnerCacheOp(pbDo, pbDo + ui32BytesToDo);
+			}
+			pbDo += ui32BytesToDo;
+			ui32ByteRemain -= ui32BytesToDo;
+			ui32BytesToDo = MIN(ui32ByteRemain, PAGE_SIZE);
+		}
+	}
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
+typedef void (*PhysicalCacheOp_t)(phys_addr_t uStart, phys_addr_t uEnd);
+#else
+typedef void (*PhysicalCacheOp_t)(unsigned long ulStart, unsigned long ulEnd);
+#endif
+
 #if defined(CONFIG_OUTER_CACHE)
 
 typedef IMG_BOOL (*MemAreaToPhys_t)(LinuxMemArea *psLinuxMemArea,
@@ -3902,88 +3981,47 @@ static IMG_BOOL IONAreaToPhys(LinuxMemArea *psLinuxMemArea,
 	return IMG_TRUE;
 }
 
-#endif /* defined(CONFIG_OUTER_CACHE) */
 
-/* g_sMMapMutex must be held while this function is called */
-
-static
-IMG_VOID *FindMMapBaseVAddr(struct list_head *psMMapOffsetStructList,
-							IMG_VOID *pvRangeAddrStart, IMG_UINT32 ui32Length)
+static inline void DoPhysicalCacheOp(LinuxMemArea *psLinuxMemArea,
+                                     IMG_VOID *pvRangeAddrStart,
+                                     IMG_SIZE_T uiLength,
+                                     IMG_UINTPTR_T uPageNumOffset,
+                                     MemAreaToPhys_t pfnMemAreaToPhys,
+                                     PhysicalCacheOp_t pfnPhysicalCacheOp)
 {
-	PKV_OFFSET_STRUCT psOffsetStruct;
-	IMG_VOID *pvMinVAddr;
+	unsigned long sStart, sEnd;
+	unsigned long ulLength, ulStartOffset, ulEndOffset;
+	IMG_UINT32 i, ui32NumPages;
+	IMG_BOOL bValidPage;
 
-	/* There's no kernel-virtual for this type of allocation, so if
-	 * we're flushing it, it must be user-virtual, and therefore
-	 * have a mapping.
-	 */
-	list_for_each_entry(psOffsetStruct, psMMapOffsetStructList, sAreaItem)
+	/* Length and offsets of flush region WRT page alignment */
+	ulLength = (unsigned long)uiLength;
+	ulStartOffset = ((unsigned long)pvRangeAddrStart) & (PAGE_SIZE - 1);
+	ulEndOffset = ((unsigned long)pvRangeAddrStart + ulLength) & (PAGE_SIZE - 1);
+
+	/* The affected pages, rounded up */
+	ui32NumPages = (ulStartOffset + ulLength + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+	for(i = 0; i < ui32NumPages; i++)
 	{
-		if(OSGetCurrentProcessIDKM() != psOffsetStruct->ui32PID)
-			continue;
-
-		pvMinVAddr = (IMG_VOID *)psOffsetStruct->ui32UserVAddr;
-
-		/* Within permissible range */
-		if(pvRangeAddrStart >= pvMinVAddr &&
-		   ui32Length <= psOffsetStruct->ui32RealByteSize)
-			return pvMinVAddr;
-	}
-
-	return IMG_NULL;
-}
-
-extern PVRSRV_LINUX_MUTEX g_sMMapMutex;
-
-#if ! defined(__arm__)
-# define USE_VIRTUAL_CACHE_OP
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0)
-# define USE_VIRTUAL_CACHE_OP
-# if defined(CONFIG_OUTER_CACHE)
-#  define USE_PHYSICAL_CACHE_OP
-# endif
-#else
-# define USE_PHYSICAL_CACHE_OP
-#endif
-
-static inline void DoInnerCacheOp(IMG_HANDLE hOSMemHandle,
-								  IMG_UINT32 ui32ByteOffset,
-								  IMG_VOID *pvRangeAddrStart,
-								  IMG_UINT32 ui32Length,
-								  InnerCacheOp_t pfnInnerCacheOp)
-{
-	LinuxMemArea *psLinuxMemArea = hOSMemHandle;
-
-	if (!psLinuxMemArea->hBMHandle)
-	{
-		pfnInnerCacheOp(pvRangeAddrStart, pvRangeAddrStart + ui32Length);
-	}
-	else
-	{
-		IMG_UINT32 ui32ByteRemain = ui32Length;
-		IMG_UINT32 ui32BytesToDo = PAGE_SIZE - (((IMG_UINT32) pvRangeAddrStart) & (~PAGE_MASK));
-		IMG_UINT8 *pbDo = (IMG_UINT8 *) pvRangeAddrStart;
-	
-		while(ui32ByteRemain)
+		bValidPage = pfnMemAreaToPhys(psLinuxMemArea, pvRangeAddrStart,
+					      uPageNumOffset, i, &sStart);
+		if (bValidPage)
 		{
-			if (BM_MapPageAtOffset(psLinuxMemArea->hBMHandle, ui32ByteOffset + (ui32Length - ui32ByteRemain)))
-			{
-				pfnInnerCacheOp(pbDo, pbDo + ui32BytesToDo);
-			}
-			pbDo += ui32BytesToDo;
-			ui32ByteRemain -= ui32BytesToDo;
-			ui32BytesToDo = MIN(ui32ByteRemain, PAGE_SIZE);
+			sEnd = sStart + PAGE_SIZE;
+
+			if(i == ui32NumPages - 1 && ulEndOffset != 0)
+				sEnd = sStart + ulEndOffset;
+
+			if(i == 0)
+				sStart += ulStartOffset;
+
+			pfnPhysicalCacheOp(sStart, sEnd);
 		}
 	}
 }
 
-#if defined(USE_PHYSICAL_CACHE_OP)
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
-typedef void (*PhysicalCacheOp_t)(phys_addr_t uStart, phys_addr_t uEnd);
-#else
-typedef void (*PhysicalCacheOp_t)(unsigned long ulStart, unsigned long ulEnd);
-#endif
+#elif defined(USE_PHYSICAL_CACHE_OP) /* else for defined(CONFIG_OUTER_CACHE) */
 
 /*
 	Note: use IMG_CPU_PHYADDR to return CPU Phys Addresses, and not just 'unsigned long',
@@ -4090,7 +4128,7 @@ static inline void DoPhysicalCacheOp(LinuxMemArea *psLinuxMemArea,
 	}
 }
 
-#endif /* defined(USE_PHYSICAL_CACHE_OP) */
+#endif /* defined(USE_PHYSICAL_CACHE_OP) or defined(CONFIG_OUTER_CACHE) */
 
 #if defined(USE_VIRTUAL_CACHE_OP)
 typedef void (*VirtualCacheOp_t)(const void *pvStart, const void *pvEnd);
